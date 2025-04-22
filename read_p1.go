@@ -1,24 +1,29 @@
 package main
 
 import (
-	"bufio"     // Used for efficient line-by-line reading
-	"fmt"       // For printing output
-	"io"        // For checking EOF error
-	"log"       // For logging status messages and errors
-	"os"        // For signal handling and error checking (ErrDeadlineExceeded)
-	"os/signal" // For signal handling
-	"regexp"    // For regular expression matching to extract values
-	"strconv"   // For converting extracted strings to numbers
-	"strings"   // For string manipulation (trimming, splitting)
-	"syscall"   // For signal handling (SIGTERM)
-	"time"      // Used for potential delays
+	"bufio"         // Used for efficient line-by-line reading
+	"context"       // For Kafka producer context
+	"encoding/json" // For JSON serialization
+	"fmt"           // For printing output
+	"io"            // For checking EOF error
+	"log"           // For logging status messages and errors
+	"os"            // For signal handling and error checking (ErrDeadlineExceeded)
+	"os/signal"     // For signal handling
+	"regexp"        // For regular expression matching to extract values
+	"strconv"       // For converting extracted strings to numbers
+	"strings"       // For string manipulation (trimming, splitting)
+	"syscall"       // For signal handling (SIGTERM)
+	"time"          // Used for potential delays
 
-	// Third-party library for serial communication
-	"go.bug.st/serial"
+	// Third-party libraries
+	"github.com/joho/godotenv"      // For loading environment variables from .env
+	"github.com/segmentio/kafka-go" // For Kafka producer
+	"go.bug.st/serial"              // For serial communication
 )
 
 // --- Configuration ---
 // !! IMPORTANT: Replace "/dev/ttyUSB0" with the actual serial port name for your P1 cable on your Raspberry Pi !!
+// This will ideally be read from the environment/config later.
 const portName = "/dev/ttyUSB0" // Example: "/dev/ttyUSB0", "/dev/ttyACM0"
 
 // Common P1 port settings (DSMR v5.0 standard).
@@ -37,18 +42,19 @@ const readInterval = 9 * time.Second
 // --- Data Structures ---
 
 // P1Data holds the extracted values from a single telegram.
-// We only extract a few key values for this example.
+// JSON tags with "omitempty" are used to control which fields are included
+// in the JSON output when marshalling a map containing these values.
 type P1Data struct {
-	Timestamp               string  // Telegram timestamp (YYMMDDHHMMSS)
-	ElectricityConsumption1 float64 // Meter Reading electricity delivered to client (Tariff 1) in kWh
-	ElectricityConsumption2 float64 // Meter Reading electricity delivered to client (Tariff 2) in kWh
-	ElectricityProduction1  float64 // Meter Reading electricity delivered by client (Tariff 1) in kWh
-	ElectricityProduction2  float64 // Meter Reading electricity delivered by client (Tariff 2) in kWh
-	CurrentTariff           int     // Current Tariff indicator (1 or 2)
-	CurrentConsumption      float64 // Actual electricity power delivered (+P) in kW
-	CurrentProduction       float64 // Actual electricity power received (-P) in kW
-	GasTimestamp            string  // Timestamp of gas reading (YYMMDDHHMMSS)
-	GasConsumption          float64 // Gas meter reading in m3
+	Timestamp               string  `json:"timestamp"`                         // Telegram timestamp (YYMMDDHHMMSS) - Always included
+	ElectricityConsumption1 float64 `json:"electricityConsumption1,omitempty"` // Meter Reading electricity delivered to client (Tariff 1) in kWh
+	ElectricityConsumption2 float64 `json:"electricityConsumption2,omitempty"` // Meter Reading electricity delivered to client (Tariff 2) in kWh
+	ElectricityProduction1  float64 `json:"electricityProduction1,omitempty"`  // Meter Reading electricity delivered by client (Tariff 1) in kWh
+	ElectricityProduction2  float64 `json:"electricityProduction2,omitempty"`  // Meter Reading electricity delivered by client (Tariff 2) in kWh
+	CurrentTariff           int     `json:"currentTariff,omitempty"`           // Current Tariff indicator (1 or 2)
+	CurrentConsumption      float64 `json:"currentConsumption,omitempty"`      // Actual electricity power delivered (+P) in kW
+	CurrentProduction       float64 `json:"currentProduction,omitempty"`       // Actual electricity power received (-P) in kW
+	GasTimestamp            string  `json:"gasTimestamp,omitempty"`            // Timestamp of gas reading (YYMMDDHHMMSS)
+	GasConsumption          float64 `json:"gasConsumption,omitempty"`          // Gas meter reading in m3
 }
 
 // --- Regular Expressions ---
@@ -65,10 +71,56 @@ var (
 	regexGas            = regexp.MustCompile(`^0-1:24\.2\.1\(([0-9]{12})[WS]\)\(([0-9]+\.[0-9]{3})\*m3\)`)
 )
 
+// --- Global Variables ---
+var lastParsedData P1Data // Stores the data from the previous successful telegram parse
+
 // --- Main Function ---
 
 func main() {
-	log.Println("Starting P1 telegram reader...")
+	// Load environment variables from .env file
+	err := godotenv.Load()
+	if err != nil {
+		// Log a warning if .env is not found, but don't fatal,
+		// as variables might be set directly in the environment.
+		log.Println("Warning: Could not load .env file. Ensure environment variables are set.")
+	}
+
+	// Read Kafka configuration from environment variables
+	kafkaBroker := os.Getenv("KAFKA_BROKER_ADDRESS")
+	electricityTopic := os.Getenv("KAFKA_ELECTRICITY_TOPIC")
+	gasTopic := os.Getenv("KAFKA_GAS_TOPIC")
+
+	if kafkaBroker == "" || electricityTopic == "" || gasTopic == "" {
+		log.Fatal("Kafka environment variables (KAFKA_BROKER_ADDRESS, KAFKA_ELECTRICITY_TOPIC, KAFKA_GAS_TOPIC) not set!")
+	}
+
+	log.Printf("Kafka Broker Address: %s", kafkaBroker)
+	log.Printf("Electricity Topic: %s", electricityTopic)
+	log.Printf("Gas Topic: %s", gasTopic)
+	log.Println("Starting P1 telegram reader and Kafka producer...")
+
+	// --- Kafka Producer Setup ---
+	// Create a new Kafka producer
+	producer := &kafka.Writer{
+		Addr:     kafka.TCP(kafkaBroker),
+		Balancer: &kafka.LeastBytes{}, // Use LeastBytes balancer for even distribution
+		// Tune batching for better performance
+		BatchTimeout: 1 * time.Second,                             // Wait up to 1 second to build a batch (decreased from 5s)
+		BatchSize:    200,                                         // Attempt to batch up to 200 messages (increased from 100)
+		RequiredAcks: kafka.RequireAll,                            // Keep RequireAll for durability (can change to RequiredLocal if needed for speed)
+		Logger:       log.New(os.Stdout, "KAFKA ", log.LstdFlags), // Add Kafka-specific logging
+		// WriteTimeout is set per WriteMessages call via context
+	}
+	// Ensure the producer is closed when the main function exits
+	defer func() {
+		log.Println("Closing Kafka producer...")
+		if closeErr := producer.Close(); closeErr != nil {
+			log.Printf("Error closing Kafka producer: %v", closeErr)
+		} else {
+			log.Println("Kafka producer closed successfully.")
+		}
+	}()
+	// --- End Kafka Producer Setup ---
 
 	// --- Signal Handling ---
 	// Create a channel to listen for OS signals
@@ -76,22 +128,22 @@ func main() {
 	// Notify the channel for Interrupt (Ctrl+C) and Terminate signals
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	// Create a channel to signal the main loop to stop
-	done := make(chan struct{})
+	// Create a context that will be cancelled on shutdown signal
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Ensure cancel is called
 
-	// Start a goroutine that waits for a signal and signals the main loop to stop
+	// Start a goroutine that waits for a signal and cancels the context
 	go func() {
 		<-sigChan // Block until a signal is received
 		log.Println("Received interrupt signal. Initiating shutdown...")
-		close(done) // Signal the main loop to exit
+		cancel() // Cancel the context
 	}()
 	// --- End Signal Handling ---
 
 	// Main loop to repeatedly open, read, close, and wait
 	for {
 		select {
-		case <-done:
-			// Received shutdown signal, exit the loop
+		case <-ctx.Done(): // Check if context is cancelled (shutdown signal)
 			log.Println("Shutdown signal received. Exiting program.")
 			return // Exit main function
 		default:
@@ -121,8 +173,7 @@ func main() {
 			case <-time.After(readInterval):
 				// Waited for the interval, try again
 				continue
-			case <-done:
-				// Received shutdown signal while waiting
+			case <-ctx.Done(): // Check if context is cancelled while waiting
 				log.Println("Shutdown signal received while waiting to open port. Exiting program.")
 				return
 			}
@@ -138,8 +189,7 @@ func main() {
 		// Loop to read lines until a complete telegram is found or shutdown is signaled
 		for !telegramComplete {
 			select {
-			case <-done:
-				// Received shutdown signal, exit the inner read loop
+			case <-ctx.Done(): // Check if context is cancelled (shutdown signal)
 				log.Println("Shutdown signal received while reading telegram. Closing port.")
 				port.Close() // Close the port immediately
 				return       // Exit main function
@@ -220,6 +270,135 @@ func main() {
 				fmt.Printf("  Gas Timestamp: %s\n", parsedData.GasTimestamp)
 				fmt.Printf("  Gas Consumption: %.3f m3\n", parsedData.GasConsumption)
 				fmt.Println("----------------------")
+
+				// --- Kafka Producing Logic (Send only changed values) ---
+				// Build maps containing only the fields that have changed, plus the timestamps.
+				// This results in a JSON object where missing fields indicate no change.
+				electricityUpdate := make(map[string]interface{})
+				gasUpdate := make(map[string]interface{})
+
+				// Flag to track if any non-timestamp fields changed
+				electricityChanged := false
+				gasChanged := false
+
+				// Always include the P1 telegram timestamp and the processing timestamp for context
+				electricityUpdate["telegramTimestamp"] = parsedData.Timestamp
+				gasUpdate["telegramTimestamp"] = parsedData.Timestamp
+				// Add the current UTC time when this data is being processed
+				processingTimestamp := time.Now().UTC()
+				electricityUpdate["processingTimestampUTC"] = processingTimestamp
+				gasUpdate["processingTimestampUTC"] = processingTimestamp
+
+				// Compare and add changed electricity fields
+				if parsedData.ElectricityConsumption1 != lastParsedData.ElectricityConsumption1 {
+					electricityUpdate["electricityConsumption1"] = parsedData.ElectricityConsumption1
+					electricityChanged = true
+				}
+				if parsedData.ElectricityConsumption2 != lastParsedData.ElectricityConsumption2 {
+					electricityUpdate["electricityConsumption2"] = parsedData.ElectricityConsumption2
+					electricityChanged = true
+				}
+				if parsedData.ElectricityProduction1 != lastParsedData.ElectricityProduction1 {
+					electricityUpdate["electricityProduction1"] = parsedData.ElectricityProduction1
+					electricityChanged = true
+				}
+				if parsedData.ElectricityProduction2 != lastParsedData.ElectricityProduction2 {
+					electricityUpdate["electricityProduction2"] = parsedData.ElectricityProduction2
+					electricityChanged = true
+				}
+				if parsedData.CurrentTariff != lastParsedData.CurrentTariff {
+					electricityUpdate["currentTariff"] = parsedData.CurrentTariff
+					electricityChanged = true
+				}
+				if parsedData.CurrentConsumption != lastParsedData.CurrentConsumption {
+					electricityUpdate["currentConsumption"] = parsedData.CurrentConsumption
+					electricityChanged = true
+				}
+				if parsedData.CurrentProduction != lastParsedData.CurrentProduction {
+					electricityUpdate["currentProduction"] = parsedData.CurrentProduction
+					electricityChanged = true
+				}
+
+				// Compare and add changed gas fields
+				// Note: Gas timestamp is also a value from the meter, compare it
+				if parsedData.GasTimestamp != lastParsedData.GasTimestamp {
+					gasUpdate["gasTimestamp"] = parsedData.GasTimestamp // Include the meter's gas timestamp if it changed
+					gasChanged = true
+				}
+				if parsedData.GasConsumption != lastParsedData.GasConsumption {
+					gasUpdate["gasConsumption"] = parsedData.GasConsumption
+					gasChanged = true
+				}
+
+				// Send electricity update if any electricity-related values changed
+				// We also send if it's the very first read (lastParsedData is zero-valued)
+				if electricityChanged || (lastParsedData == P1Data{}) {
+					msgValue, jsonErr := json.Marshal(electricityUpdate)
+					if jsonErr != nil {
+						log.Printf("⚠️ Error marshalling electricity data to JSON: %v", jsonErr)
+					} else {
+						msg := kafka.Message{
+							Topic: electricityTopic,
+							Value: msgValue,
+							// Consider adding a Key if you want messages for the same meter
+							// to go to the same partition. For P1 data, the meter is the source,
+							// so a fixed key representing this meter might be appropriate.
+							// Key: []byte("your-meter-id"), // Example
+							Time: processingTimestamp, // Set Kafka message timestamp to current UTC time
+						}
+						// Increased timeout for writing to Kafka
+						writeCtx, cancelWrite := context.WithTimeout(ctx, 10*time.Second)
+						defer cancelWrite()
+						log.Printf("KAFKA: Attempting to write electricity message to topic %s...", electricityTopic)
+						err := producer.WriteMessages(writeCtx, msg)
+						if err != nil {
+							log.Printf("❌ Failed to write electricity message to Kafka: %v", err)
+						} else {
+							log.Printf("✅ Successfully wrote electricity message to topic %s", electricityTopic)
+							// log.Printf("✅ Sent electricity update to topic %s: %s", electricityTopic, string(msgValue)) // Uncomment for verbose output
+						}
+					}
+				} else {
+					log.Println("No electricity values changed. Skipping Kafka message.")
+				}
+
+				// Send gas update if any gas-related values changed
+				// We also send if it's the very first read (lastParsedData is zero-valued)
+				if gasChanged || (lastParsedData == P1Data{}) {
+					msgValue, jsonErr := json.Marshal(gasUpdate)
+					if jsonErr != nil {
+						log.Printf("⚠️ Error marshalling gas data to JSON: %v", jsonErr)
+					} else {
+						msg := kafka.Message{
+							Topic: gasTopic,
+							Value: msgValue,
+							// Consider adding a Key here as well, perhaps the same meter ID
+							// Key: []byte("your-meter-id"), // Example
+							Time: processingTimestamp, // Set Kafka message timestamp to current UTC time
+						}
+						// Increased timeout for writing to Kafka
+						writeCtx, cancelWrite := context.WithTimeout(ctx, 10*time.Second)
+						defer cancelWrite()
+						log.Printf("KAFKA: Attempting to write gas message to topic %s...", gasTopic)
+						err := producer.WriteMessages(writeCtx, msg)
+						if err != nil {
+							log.Printf("❌ Failed to write gas message to Kafka: %v", err)
+						} else {
+							log.Printf("✅ Successfully wrote gas message to topic %s", gasTopic)
+							// log.Printf("✅ Sent gas update to topic %s: %s", gasTopic, string(msgValue)) // Uncomment for verbose output
+						}
+					}
+				} else {
+					log.Println("No gas values changed. Skipping Kafka message.")
+				}
+
+				// Update lastParsedData for the next comparison
+				// Note: On the very first read, lastParsedData will be the zero value,
+				// causing all fields to be considered "changed" and sent. This is desired
+				// to establish the initial state in Kafka.
+				lastParsedData = parsedData
+
+				// --- End Kafka Producing Logic ---
 			}
 		} else if !telegramComplete {
 			// If the inner loop broke without completing a telegram (due to read error/timeout)
@@ -239,8 +418,7 @@ func main() {
 		select {
 		case <-time.After(readInterval):
 			// Waited for the interval, continue loop for next read cycle
-		case <-done:
-			// Received shutdown signal while waiting
+		case <-ctx.Done(): // Check if context is cancelled while waiting
 			log.Println("Shutdown signal received while waiting. Exiting program.")
 			return // Exit main function
 		}

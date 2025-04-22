@@ -1,0 +1,38 @@
+[Unit]
+Description=P1 port is read and the electricity data is sent to a topic in kafka and so is the gas
+After=network.target
+
+[Service]
+# User and Group the service will run as.
+# Replace 'your_user' with the actual username you use on your Raspberry Pi (e.g., 'pi').
+User=jd
+Group=jd
+
+# Set the working directory to where your application and .env file are located.
+# Replace '/path/to/your/enphase_app' with the actual path on your Raspberry Pi.
+WorkingDirectory=/home/jd/workspace/p1-port/
+
+# Load environment variables from the .env file.
+# This is crucial for your application to pick up the configuration.
+# Adjust the path if your .env file is not in the WorkingDirectory.
+EnvironmentFile=/home/jd/workspace/p1-port/.env
+
+# Command to execute when the service starts.
+# './enphase_publisher' is the name of the executable you built.
+# Make sure the executable is in the WorkingDirectory.
+ExecStart=/home/jd/workspace/p1-port/p1-port-reader-app
+
+# Restart the service if it stops unexpectedly.
+Restart=always
+
+# Define the restart policy delay.
+RestartSec=10
+
+# StandardOutput and StandardError are captured by systemd's journal by default.
+# This means your log.Println/Printf output will go to journald.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
