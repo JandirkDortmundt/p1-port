@@ -1,1 +1,12 @@
 .env
+.venv
+.pyiceberg.yaml
+energy_lakehouse/
+p1-port-reader-app
+requirements.txt
+kafka_offset.ddb
+p1-port-reader.service
+go.mod
+go.sum
+Dockerfile
+docker-compose.yml
